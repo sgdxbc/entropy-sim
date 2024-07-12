@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng, SeedableRng};
+use rand_distr::{Distribution, Exp, Geometric};
+
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
 
@@ -160,7 +164,8 @@ impl System {
         let num_step_failure = self.failure_count as f32 / self.step_count as f32;
         let churn = self.failure_count as f32
             / self.config.num_node as f32
-            / (self.step_count as f32 / 1000.)
+            // / (self.step_count as f32 / 1000.)
+            / self.step_count as f32
             * 100.;
         let redundancy = self
             .data
@@ -171,7 +176,7 @@ impl System {
         eprint!(
             "{:<120}",
             format!(
-                "\r[step {:7}] {:3} alive, {num_step_failure:4.2} failures/step, {churn:4.2}% churn/1K step, {redundancy:4.2} fragments/data",
+                "\r[step {:7}] {:3} alive, {num_step_failure:4.2} failures/step ({churn:4.2}% churn), {redundancy:4.2} fragments/data",
                 self.step_count,
                 self.data.len(),
             )
@@ -253,6 +258,40 @@ impl FailureGenerator for IndependentFailure {
         for equiv in 0..system.config.num_node {
             system.domains.push((vec![equiv as _], self.rate))
         }
+        eprintln!("generated independent failures")
+    }
+}
+
+struct CorrelatedFailure {
+    num_domain: usize,
+    size_distr: Geometric,
+    rate_distr: Exp<f64>,
+}
+
+impl FailureGenerator for CorrelatedFailure {
+    fn rate(&self, system: &mut System, rng: &mut impl Rng) {
+        for i in 0..self.num_domain {
+            let size = self.size_distr.sample(rng) + 2;
+            let nodes = system
+                .nodes
+                .values()
+                .map(|node| node.equiv)
+                .choose_multiple(rng, size as _);
+            assert!(nodes.len() == size as _);
+            system.domains.push((nodes, self.rate_distr.sample(rng)));
+            if (i + 1) % (self.num_domain / 100) == 0 {
+                eprint!("\r{:<120}", format!("generated {} domains", i + 1))
+            }
+        }
+    }
+}
+
+struct Merge<F, G>(F, G);
+
+impl<F: FailureGenerator, G: FailureGenerator> FailureGenerator for Merge<F, G> {
+    fn rate(&self, system: &mut System, rng: &mut impl Rng) {
+        self.0.rate(system, rng);
+        self.1.rate(system, rng)
     }
 }
 
@@ -261,9 +300,18 @@ fn main() {
         num_node: 100_000,
         num_data: 100,
     };
-    let failure_generator = IndependentFailure { rate: 1e-4 };
-    let mut protocol = NopProtocol { n: 3, k: 1 };
-    // let mut protocol = RingSuccessorProtocol { n: 3, k: 1 };
+    let failure_generator = IndependentFailure { rate: 1e-5 };
+    let failure_generator = Merge(
+        failure_generator,
+        CorrelatedFailure {
+            num_domain: 10_000,
+            // average size = 100
+            size_distr: Geometric::new(1. / 998.).expect("valid parameter"),
+            rate_distr: Exp::new(1e4).expect("valid parameter"),
+        },
+    );
+    // let mut protocol = NopProtocol { n: 3, k: 1 };
+    let mut protocol = RingSuccessorProtocol { n: 12, k: 4 };
 
     let mut rng = StdRng::seed_from_u64(117418);
     let mut system = System::new(parameters);
