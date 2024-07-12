@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
+
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng, SeedableRng};
 
 type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
-type HashSet<V> = rustc_hash::FxHashSet<V>;
 
 trait FailureGenerator {
     fn rate(&self, system: &mut System, rng: &mut impl Rng);
@@ -10,26 +11,29 @@ trait FailureGenerator {
 trait Protocol {
     fn enter(&mut self, data_digest: &Digest, system: &mut System, rng: &mut impl Rng);
 
-    fn repair(&mut self, data_digest: &Digest, system: &mut System, rng: &mut impl Rng) -> bool;
+    fn maintain(&mut self, data_digest: &Digest, system: &mut System, rng: &mut impl Rng) -> bool;
 }
 
 type Digest = [u8; 32];
 
 struct Node {
     equiv: NodeEquiv,
-    fragments: Vec<(Digest, FragmentIndex)>,
+    fragments: HashMap<Digest, FragmentIndex>,
 }
 
 type NodeEquiv = u32;
 type FragmentIndex = usize;
 
-#[derive(Default)]
 struct System {
     step_count: u32,
+    failure_count: u32,
+
     domains: Vec<(Vec<NodeEquiv>, f64)>,
-    nodes: HashMap<NodeId, Node>,
+    nodes: BTreeMap<NodeId, Node>,
     node_equiv: Vec<NodeId>,
     data: HashMap<Digest, HashMap<FragmentIndex, NodeId>>,
+
+    config: SystemParameters,
 }
 
 type NodeId = [u8; 32];
@@ -40,20 +44,27 @@ struct SystemParameters {
 }
 
 impl System {
-    fn new() -> Self {
-        Self::default()
+    fn new(config: SystemParameters) -> Self {
+        Self {
+            config,
+            step_count: 0,
+            failure_count: 0,
+            domains: Default::default(),
+            nodes: Default::default(),
+            node_equiv: Default::default(),
+            data: Default::default(),
+        }
     }
 
     fn init(
         &mut self,
-        config: SystemParameters,
         failure_generator: &impl FailureGenerator,
         protocol: &mut impl Protocol,
         rng: &mut impl Rng,
     ) {
         self.node_equiv
-            .resize_with(config.num_node, Default::default);
-        for equiv in 0..config.num_node {
+            .resize_with(self.config.num_node, Default::default);
+        for equiv in 0..self.config.num_node {
             let id = rng.gen();
             let replaced = self.nodes.insert(
                 id,
@@ -65,7 +76,7 @@ impl System {
             assert!(replaced.is_none());
             self.node_equiv[equiv] = id
         }
-        for _ in 0..config.num_data {
+        for _ in 0..self.config.num_data {
             let digest = rng.gen();
             let replaced = self.data.insert(digest, Default::default());
             assert!(replaced.is_none());
@@ -79,7 +90,6 @@ impl System {
     }
 
     fn step(&mut self, protocol: &mut impl Protocol, rng: &mut impl Rng) {
-        let mut involved_data = HashSet::default();
         for (nodes, failure_rate) in &self.domains {
             if !rng.gen_bool(*failure_rate) {
                 continue;
@@ -89,13 +99,13 @@ impl System {
                 let Some(mut node) = self.nodes.remove(id) else {
                     continue;
                 };
-                for (digest, index) in node.fragments.drain(..) {
+                self.failure_count += 1;
+                for (digest, index) in node.fragments.drain() {
                     self.data
                         .get_mut(&digest)
                         .expect("data is not lost (yet)")
                         .remove(&index)
                         .expect("fragment is present");
-                    involved_data.insert(digest);
                 }
                 let id = rng.gen();
                 let replaced = self.nodes.insert(id, node);
@@ -103,30 +113,69 @@ impl System {
                 self.node_equiv[*equiv as usize] = id
             }
         }
-        for digest in involved_data {
-            if protocol.repair(&digest, self, rng) {
+        for digest in self.data.keys().cloned().collect::<Vec<_>>() {
+            if protocol.maintain(&digest, self, rng) {
                 continue;
             }
-            println!("[step {:8}] data {digest:02x?} is lost", self.step_count);
             self.data
                 .remove(&digest)
                 .expect("data is not lost before failed repair");
+            self.print()
         }
         self.step_count += 1
     }
 
     fn store(&mut self, digest: &Digest, index: FragmentIndex, id: &NodeId) {
-        self.nodes
+        let replaced = self
+            .nodes
             .get_mut(id)
             .expect("node exists")
             .fragments
-            .push((*digest, index)); // check multiple fragments on same node?
+            .insert(*digest, index);
+        assert!(replaced.is_none());
         let replaced = self
             .data
             .get_mut(digest)
             .expect("data exists")
             .insert(index, *id);
         assert!(replaced.is_none())
+    }
+
+    fn garbage_collect(&mut self, digest: &Digest, id: &NodeId) {
+        let index = self
+            .nodes
+            .get_mut(id)
+            .expect("node exists")
+            .fragments
+            .remove(digest)
+            .expect("fragment exists");
+        self.data
+            .get_mut(digest)
+            .expect("data exists")
+            .remove(&index)
+            .expect("fragment exists");
+    }
+
+    fn print(&self) {
+        let num_step_failure = self.failure_count as f32 / self.step_count as f32;
+        let churn = self.failure_count as f32
+            / self.config.num_node as f32
+            / (self.step_count as f32 / 1000.)
+            * 100.;
+        let redundancy = self
+            .data
+            .values()
+            .map(|fragments| fragments.len())
+            .sum::<usize>() as f32
+            / self.data.len() as f32;
+        eprint!(
+            "{:<120}",
+            format!(
+                "\r[step {:7}] {:3} alive, {num_step_failure:4.2} failures/step, {churn:4.2}% churn/1K step, {redundancy:4.2} fragments/data",
+                self.step_count,
+                self.data.len(),
+            )
+        )
     }
 }
 
@@ -139,13 +188,59 @@ impl Protocol for NopProtocol {
     fn enter(&mut self, data_digest: &Digest, system: &mut System, rng: &mut impl Rng) {
         let ids = system.nodes.keys().copied().choose_multiple(rng, self.n);
         assert!(ids.len() == self.n);
-        for id in ids {
-            system.store(data_digest, 0, &id)
+        for (index, id) in ids.into_iter().enumerate() {
+            system.store(data_digest, index, &id)
         }
     }
 
-    fn repair(&mut self, digest: &Digest, system: &mut System, _: &mut impl Rng) -> bool {
+    fn maintain(&mut self, digest: &Digest, system: &mut System, _: &mut impl Rng) -> bool {
         system.data[digest].len() >= self.k
+    }
+}
+
+struct RingSuccessorProtocol {
+    n: usize,
+    k: usize,
+}
+
+impl RingSuccessorProtocol {
+    fn store(&self, digest: &Digest, system: &mut System) {
+        let mut nodes = system
+            .nodes
+            .range(*digest..)
+            .take(self.n)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        if nodes.len() < self.n {
+            nodes.extend(system.nodes.keys().take(self.n - nodes.len()).copied())
+        }
+        for (index, node_id) in nodes.iter().enumerate() {
+            if let Some(other_id) = system.data[digest].get(&index) {
+                if other_id != node_id {
+                    let other_id = *other_id;
+                    system.garbage_collect(digest, &other_id)
+                }
+            }
+        }
+        for (index, node_id) in nodes.iter().enumerate() {
+            if !system.data[digest].contains_key(&index) {
+                system.store(digest, index, node_id)
+            }
+        }
+    }
+}
+
+impl Protocol for RingSuccessorProtocol {
+    fn enter(&mut self, data_digest: &Digest, system: &mut System, _: &mut impl Rng) {
+        self.store(data_digest, system)
+    }
+
+    fn maintain(&mut self, data_digest: &Digest, system: &mut System, _: &mut impl Rng) -> bool {
+        if system.data[data_digest].len() < self.k {
+            return false;
+        }
+        self.store(data_digest, system);
+        true
     }
 }
 
@@ -155,7 +250,7 @@ struct IndependentFailure {
 
 impl FailureGenerator for IndependentFailure {
     fn rate(&self, system: &mut System, _: &mut impl Rng) {
-        for equiv in 0..system.nodes.len() {
+        for equiv in 0..system.config.num_node {
             system.domains.push((vec![equiv as _], self.rate))
         }
     }
@@ -166,16 +261,18 @@ fn main() {
         num_node: 100_000,
         num_data: 100,
     };
-    let failure_generator = IndependentFailure { rate: 1e-3 };
-    let mut protocol = NopProtocol { n: 1, k: 1 };
+    let failure_generator = IndependentFailure { rate: 1e-4 };
+    let mut protocol = NopProtocol { n: 3, k: 1 };
+    // let mut protocol = RingSuccessorProtocol { n: 3, k: 1 };
 
     let mut rng = StdRng::seed_from_u64(117418);
-    let mut system = System::new();
-    system.init(parameters, &failure_generator, &mut protocol, &mut rng);
-    while system.step_count < 1_000_000 && !system.finalized() {
+    let mut system = System::new(parameters);
+    system.init(&failure_generator, &mut protocol, &mut rng);
+    while system.step_count < 100_000 && !system.finalized() {
         system.step(&mut protocol, &mut rng);
-        if system.step_count % 10_000 == 0 {
-            eprint!("\rstep {}", system.step_count)
+        if system.step_count % 1_000 == 0 {
+            system.print()
         }
     }
+    eprintln!()
 }
