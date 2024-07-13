@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng, SeedableRng};
 use rand_distr::{Distribution, Exp, Geometric};
@@ -105,11 +108,11 @@ impl System {
                 };
                 self.failure_count += 1;
                 for (digest, index) in node.fragments.drain() {
-                    self.data
-                        .get_mut(&digest)
-                        .expect("data is not lost (yet)")
-                        .remove(&index)
-                        .expect("fragment is present");
+                    if let Some(fragments) = self.data.get_mut(&digest) {
+                        fragments.remove(&index).expect("fragment is present");
+                    }
+                    // .expect("data is not lost (yet)")
+                    // .remove(&index)
                 }
                 let id = rng.gen();
                 let replaced = self.nodes.insert(id, node);
@@ -258,7 +261,7 @@ impl FailureGenerator for IndependentFailure {
         for equiv in 0..system.config.num_node {
             system.domains.push((vec![equiv as _], self.rate))
         }
-        eprintln!("generated independent failures")
+        eprint!("\rgenerated independent failures")
     }
 }
 
@@ -268,8 +271,20 @@ struct CorrelatedFailure {
     rate_distr: Exp<f64>,
 }
 
+impl CorrelatedFailure {
+    fn new(num_domain: usize, mean_size: usize, failure_rate: f64) -> Self {
+        assert!(mean_size > 2);
+        Self {
+            num_domain,
+            size_distr: Geometric::new(1. / (mean_size as f64 - 2.)).expect("valid parameter"),
+            rate_distr: Exp::new(1. / failure_rate).expect("valid parameter"),
+        }
+    }
+}
+
 impl FailureGenerator for CorrelatedFailure {
     fn rate(&self, system: &mut System, rng: &mut impl Rng) {
+        let mut period = Period(Instant::now());
         for i in 0..self.num_domain {
             let size = self.size_distr.sample(rng) + 2;
             let nodes = system
@@ -279,9 +294,7 @@ impl FailureGenerator for CorrelatedFailure {
                 .choose_multiple(rng, size as _);
             assert!(nodes.len() == size as _);
             system.domains.push((nodes, self.rate_distr.sample(rng)));
-            if (i + 1) % (self.num_domain / 100) == 0 {
-                eprint!("\r{:<120}", format!("generated {} domains", i + 1))
-            }
+            period.run(|| eprint!("\r{:<120}", format!("generated {} domains", i + 1)))
         }
     }
 }
@@ -295,32 +308,44 @@ impl<F: FailureGenerator, G: FailureGenerator> FailureGenerator for Merge<F, G> 
     }
 }
 
+struct Period(Instant);
+
+impl Period {
+    fn run(&mut self, task: impl FnOnce()) {
+        if self.0.elapsed() > Duration::from_secs(1) {
+            task();
+            self.0 = Instant::now()
+        }
+    }
+}
+
 fn main() {
     let parameters = SystemParameters {
-        num_node: 100_000,
+        num_node: 1_000,
         num_data: 100,
     };
     let failure_generator = IndependentFailure { rate: 1e-5 };
-    let failure_generator = Merge(
-        failure_generator,
-        CorrelatedFailure {
-            num_domain: 10_000,
-            // average size = 100
-            size_distr: Geometric::new(1. / 998.).expect("valid parameter"),
-            rate_distr: Exp::new(1e4).expect("valid parameter"),
-        },
-    );
+    let failure_generator = Merge(failure_generator, {
+        let num_domain = 1_000_000;
+        let mean_size = 40;
+        let num_step_failure = 20.;
+        // num_domain * failure_rate * mean_size = num_step_failure
+        CorrelatedFailure::new(
+            num_domain,
+            mean_size,
+            num_step_failure / num_domain as f64 / mean_size as f64,
+        )
+    });
     // let mut protocol = NopProtocol { n: 3, k: 1 };
-    let mut protocol = RingSuccessorProtocol { n: 12, k: 4 };
+    let mut protocol = RingSuccessorProtocol { n: 8, k: 2 };
 
     let mut rng = StdRng::seed_from_u64(117418);
     let mut system = System::new(parameters);
     system.init(&failure_generator, &mut protocol, &mut rng);
+    let mut period = Period(Instant::now());
     while system.step_count < 100_000 && !system.finalized() {
         system.step(&mut protocol, &mut rng);
-        if system.step_count % 1_000 == 0 {
-            system.print()
-        }
+        period.run(|| system.print())
     }
     eprintln!()
 }
