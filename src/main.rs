@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap},
     time::{Duration, Instant},
 };
 
@@ -39,6 +40,7 @@ struct System {
     nodes: BTreeMap<NodeId, Node>,
     node_equiv: Vec<NodeId>,
     data: HashMap<Digest, HashMap<FragmentIndex, NodeId>>,
+    scheduled_failures: BinaryHeap<Reverse<(u32, usize)>>,
 
     config: SystemParameters,
 }
@@ -60,6 +62,7 @@ impl System {
             nodes: Default::default(),
             node_equiv: Default::default(),
             data: Default::default(),
+            scheduled_failures: Default::default(),
         }
     }
 
@@ -89,7 +92,10 @@ impl System {
             assert!(replaced.is_none());
             protocol.enter(&digest, self, rng)
         }
-        failure_generator.rate(self, rng)
+        failure_generator.rate(self, rng);
+        for (domain_index, (_, failure_rate)) in self.domains.clone().iter().enumerate() {
+            self.schedule(*failure_rate, rng, domain_index)
+        }
     }
 
     fn finalized(&self) -> bool {
@@ -97,29 +103,35 @@ impl System {
     }
 
     fn step(&mut self, protocol: &mut impl Protocol, rng: &mut impl Rng) {
-        for (nodes, failure_rate) in &self.domains {
-            if !rng.gen_bool(*failure_rate) {
+        let at = self
+            .scheduled_failures
+            .peek()
+            .expect("exists scheduled failures")
+            .0
+             .0;
+        assert!(at >= self.step_count, "{at} < {}", self.step_count);
+        self.step_count = at;
+        let Reverse((_, domain_index)) = self.scheduled_failures.pop().unwrap();
+        let (nodes, failure_rate) = &self.domains[domain_index];
+        for equiv in nodes {
+            let id = &self.node_equiv[*equiv as usize];
+            let Some(mut node) = self.nodes.remove(id) else {
                 continue;
-            }
-            for equiv in nodes {
-                let id = &self.node_equiv[*equiv as usize];
-                let Some(mut node) = self.nodes.remove(id) else {
-                    continue;
-                };
-                self.failure_count += 1;
-                for (digest, index) in node.fragments.drain() {
-                    if let Some(fragments) = self.data.get_mut(&digest) {
-                        fragments.remove(&index).expect("fragment is present");
-                    }
-                    // .expect("data is not lost (yet)")
-                    // .remove(&index)
+            };
+            self.failure_count += 1;
+            for (digest, index) in node.fragments.drain() {
+                if let Some(fragments) = self.data.get_mut(&digest) {
+                    fragments.remove(&index).expect("fragment is present");
                 }
-                let id = rng.gen();
-                let replaced = self.nodes.insert(id, node);
-                assert!(replaced.is_none());
-                self.node_equiv[*equiv as usize] = id
+                // .expect("data is not lost (yet)")
+                // .remove(&index)
             }
+            let id = rng.gen();
+            let replaced = self.nodes.insert(id, node);
+            assert!(replaced.is_none());
+            self.node_equiv[*equiv as usize] = id
         }
+        self.schedule(*failure_rate, rng, domain_index);
         for digest in self.data.keys().cloned().collect::<Vec<_>>() {
             if protocol.maintain(&digest, self, rng) {
                 continue;
@@ -129,7 +141,16 @@ impl System {
                 .expect("data is not lost before failed repair");
             self.print()
         }
-        self.step_count += 1
+        // self.step_count += 1
+    }
+
+    fn schedule(&mut self, failure_rate: f64, rng: &mut impl Rng, domain_index: usize) {
+        let interval = Exp::new(failure_rate)
+            .expect("valid parameter")
+            .sample(rng)
+            .ceil() as u32;
+        self.scheduled_failures
+            .push(Reverse((self.step_count + interval, domain_index)));
     }
 
     fn store(&mut self, digest: &Digest, index: FragmentIndex, id: &NodeId) {
@@ -328,7 +349,7 @@ fn main() {
     let failure_generator = Merge(failure_generator, {
         let num_domain = 1_000_000;
         let mean_size = 40;
-        let num_step_failure = 20.;
+        let num_step_failure = 10.;
         // num_domain * failure_rate * mean_size = num_step_failure
         CorrelatedFailure::new(
             num_domain,
@@ -336,16 +357,17 @@ fn main() {
             num_step_failure / num_domain as f64 / mean_size as f64,
         )
     });
-    // let mut protocol = NopProtocol { n: 3, k: 1 };
-    let mut protocol = RingSuccessorProtocol { n: 8, k: 2 };
+    // let mut protocol = NopProtocol { n: 12, k: 4 };
+    let mut protocol = RingSuccessorProtocol { n: 12, k: 4 };
 
     let mut rng = StdRng::seed_from_u64(117418);
     let mut system = System::new(parameters);
     system.init(&failure_generator, &mut protocol, &mut rng);
     let mut period = Period(Instant::now());
-    while system.step_count < 100_000 && !system.finalized() {
+    while system.step_count < 1_000_000 && !system.finalized() {
         system.step(&mut protocol, &mut rng);
         period.run(|| system.print())
     }
+    system.print();
     eprintln!()
 }
