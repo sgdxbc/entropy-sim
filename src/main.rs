@@ -461,20 +461,21 @@ fn main() {
         num_data: 100,
     };
     let failure_generator = IndependentFailure { rate: 1e-5 };
-    let mean_size = 120;
-    let failure_generator = Merge(failure_generator, {
-        let num_domain = 1_000_000;
-        let num_step_failure = 20.;
-        // num_domain * failure_rate * mean_size = num_step_failure
-        CorrelatedFailure::new(
-            num_domain,
-            parameters.num_node,
-            mean_size,
-            num_step_failure / num_domain as f64 / mean_size as f64,
-        )
-    });
-    // let mut protocol = NopProtocol { n: 12, k: 4 };
-    let mut protocol = RingSuccessorProtocol { n: 12, k: 4 };
+    // let mean_size = 3;
+    // let failure_generator = Merge(failure_generator, {
+    //     let num_domain = 1_000_000;
+    //     let num_step_failure = 20.;
+    //     // num_domain * failure_rate * mean_size = num_step_failure
+    //     CorrelatedFailure::new(
+    //         num_domain,
+    //         parameters.num_node,
+    //         mean_size,
+    //         num_step_failure / num_domain as f64 / mean_size as f64,
+    //     )
+    // });
+    let mean_size = 0;
+    // let mut protocol = NopProtocol { n: 8, k: 5 };
+    let mut protocol = RingSuccessorProtocol { n: 8, k: 5 };
 
     // let mut reporter = OverridingLine;
     let csv = Csv {
