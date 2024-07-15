@@ -1,7 +1,10 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
-    time::{Duration, Instant},
+    fmt::Write as _,
+    fs::{create_dir_all, write},
+    path::Path,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng, SeedableRng};
@@ -20,6 +23,10 @@ trait Protocol {
     fn enter(&mut self, data_digest: &Digest, system: &mut System, rng: &mut impl Rng);
 
     fn maintain(&mut self, data_digest: &Digest, system: &mut System, rng: &mut impl Rng) -> bool;
+
+    fn name(&self) -> &'static str;
+
+    fn redundancy(&self) -> f32;
 }
 
 type Digest = [u8; 32];
@@ -47,6 +54,7 @@ struct System {
 
 type NodeId = [u8; 32];
 
+#[derive(Clone)]
 struct SystemParameters {
     num_node: usize,
     num_data: usize,
@@ -231,6 +239,14 @@ impl Protocol for NopProtocol {
     fn maintain(&mut self, digest: &Digest, system: &mut System, _: &mut impl Rng) -> bool {
         system.data[digest].len() >= self.k
     }
+
+    fn name(&self) -> &'static str {
+        "w/o repair"
+    }
+
+    fn redundancy(&self) -> f32 {
+        self.n as f32 / self.k as f32
+    }
 }
 
 struct RingSuccessorProtocol {
@@ -276,6 +292,14 @@ impl Protocol for RingSuccessorProtocol {
         }
         self.store(data_digest, system);
         true
+    }
+
+    fn name(&self) -> &'static str {
+        "w/ repair"
+    }
+
+    fn redundancy(&self) -> f32 {
+        self.n as f32 / self.k as f32
     }
 }
 
@@ -368,6 +392,34 @@ impl Report for OverridingLine {
     }
 }
 
+struct Csv {
+    parameters: SystemParameters,
+    domain_mean_size: usize,
+    protocol: &'static str,
+    redundancy: f32,
+
+    buf: String,
+}
+
+impl Report for Csv {
+    fn report(&mut self, status: &SystemStatus) {
+        writeln!(
+            &mut self.buf,
+            "{},{},{},{},{},{},{},{},{}",
+            self.parameters.num_node,
+            self.parameters.num_data,
+            self.domain_mean_size,
+            self.protocol,
+            self.redundancy,
+            status.step,
+            status.num_alive,
+            status.num_step_failure,
+            status.churn,
+        )
+        .expect("writeln to string infallible")
+    }
+}
+
 impl<F: Report, G: Report> Report for Merge<F, G> {
     fn report(&mut self, status: &SystemStatus) {
         self.0.report(status);
@@ -381,9 +433,9 @@ fn main() {
         num_data: 100,
     };
     let failure_generator = IndependentFailure { rate: 1e-5 };
+    let mean_size = 40;
     let failure_generator = Merge(failure_generator, {
         let num_domain = 1_000_000;
-        let mean_size = 40;
         let num_step_failure = 10.;
         // num_domain * failure_rate * mean_size = num_step_failure
         CorrelatedFailure::new(
@@ -396,15 +448,37 @@ fn main() {
     let mut protocol = RingSuccessorProtocol { n: 24, k: 8 };
 
     let mut rng = StdRng::seed_from_u64(117418);
-    let mut system = System::new(parameters);
+    let mut system = System::new(parameters.clone());
     system.init(&failure_generator, &mut protocol, &mut rng);
 
     let mut period = Period(Instant::now());
-    let mut reporter = OverridingLine;
+    // let mut reporter = OverridingLine;
+    let csv = Csv {
+        parameters,
+        domain_mean_size: mean_size,
+        protocol: protocol.name(),
+        redundancy: protocol.redundancy(),
+        buf: Default::default(),
+    };
+    let mut reporter = Merge(OverridingLine, csv);
     while system.step_count < 1_000_000 && !system.finalized() {
         system.step(&mut protocol, &mut reporter, &mut rng);
         period.run(|| reporter.report(&system.status()))
     }
     reporter.report(&system.status());
-    eprintln!()
+    eprintln!();
+
+    let data_dir = Path::new("data");
+    create_dir_all(data_dir).expect("create directory is successful");
+    write(
+        data_dir.join(format!(
+            "{}.csv",
+            UNIX_EPOCH
+                .elapsed()
+                .expect("UNIX epoch is elapsed")
+                .as_secs()
+        )),
+        reporter.1.buf,
+    )
+    .expect("write data is successful")
 }
