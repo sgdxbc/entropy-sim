@@ -8,7 +8,7 @@ use std::{
 };
 
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng, SeedableRng};
-use rand_distr::{Distribution, Exp, Geometric};
+use rand_distr::{Binomial, Distribution, Exp};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -27,6 +27,8 @@ trait Protocol {
     fn name(&self) -> &'static str;
 
     fn redundancy(&self) -> f32;
+
+    fn group_size(&self) -> usize;
 }
 
 type Digest = [u8; 32];
@@ -162,8 +164,11 @@ impl System {
             .expect("valid parameter")
             .sample(rng)
             .ceil() as u32;
-        self.scheduled_failures
-            .push(Reverse((self.step_count + interval, domain_index)));
+        // assert!(self.step_count + interval >= self.step_count);
+        if u32::MAX - interval > self.step_count {
+            self.scheduled_failures
+                .push(Reverse((self.step_count + interval, domain_index)))
+        }
     }
 
     fn store(&mut self, digest: &Digest, index: FragmentIndex, id: &NodeId) {
@@ -247,6 +252,10 @@ impl Protocol for NopProtocol {
     fn redundancy(&self) -> f32 {
         self.n as f32 / self.k as f32
     }
+
+    fn group_size(&self) -> usize {
+        self.n
+    }
 }
 
 struct RingSuccessorProtocol {
@@ -301,6 +310,10 @@ impl Protocol for RingSuccessorProtocol {
     fn redundancy(&self) -> f32 {
         self.n as f32 / self.k as f32
     }
+
+    fn group_size(&self) -> usize {
+        self.n
+    }
 }
 
 struct IndependentFailure {
@@ -318,16 +331,17 @@ impl FailureGenerator for IndependentFailure {
 
 struct CorrelatedFailure {
     num_domain: usize,
-    size_distr: Geometric,
+    size_distr: Binomial,
     rate_distr: Exp<f64>,
 }
 
 impl CorrelatedFailure {
-    fn new(num_domain: usize, mean_size: usize, failure_rate: f64) -> Self {
+    fn new(num_domain: usize, num_node: usize, mean_size: usize, failure_rate: f64) -> Self {
         assert!(mean_size > 2);
         Self {
             num_domain,
-            size_distr: Geometric::new(1. / (mean_size as f64 - 2.)).expect("valid parameter"),
+            size_distr: Binomial::new(num_node as _, mean_size as f64 / num_node as f64)
+                .expect("valid parameter"),
             rate_distr: Exp::new(1. / failure_rate).expect("valid parameter"),
         }
     }
@@ -336,8 +350,14 @@ impl CorrelatedFailure {
 impl FailureGenerator for CorrelatedFailure {
     fn rate(&self, system: &mut System, rng: &mut impl Rng) {
         let mut period = Period(Instant::now());
+        let mut sizes = Vec::new();
         for i in 0..self.num_domain {
-            let size = self.size_distr.sample(rng) + 2;
+            let mut size;
+            while {
+                size = self.size_distr.sample(rng);
+                size < 2
+            } {}
+            sizes.push(size);
             let nodes = system
                 .nodes
                 .values()
@@ -347,6 +367,12 @@ impl FailureGenerator for CorrelatedFailure {
             system.domains.push((nodes, self.rate_distr.sample(rng)));
             period.run(|| eprint!("\r{:<120}", format!("generated {} domains", i + 1)))
         }
+
+        let average_size = sizes
+            .into_iter()
+            .map(|s| s as f64 / self.num_domain as f64)
+            .sum::<f64>();
+        eprintln!("\raverage domain size {average_size:.2}")
     }
 }
 
@@ -397,6 +423,7 @@ struct Csv {
     domain_mean_size: usize,
     protocol: &'static str,
     redundancy: f32,
+    group_size: usize,
 
     buf: String,
 }
@@ -405,12 +432,13 @@ impl Report for Csv {
     fn report(&mut self, status: &SystemStatus) {
         writeln!(
             &mut self.buf,
-            "{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{}",
             self.parameters.num_node,
             self.parameters.num_data,
             self.domain_mean_size,
             self.protocol,
             self.redundancy,
+            self.group_size,
             status.step,
             status.num_alive,
             status.num_step_failure,
@@ -433,34 +461,38 @@ fn main() {
         num_data: 100,
     };
     let failure_generator = IndependentFailure { rate: 1e-5 };
-    let mean_size = 40;
+    let mean_size = 120;
     let failure_generator = Merge(failure_generator, {
         let num_domain = 1_000_000;
-        let num_step_failure = 10.;
+        let num_step_failure = 20.;
         // num_domain * failure_rate * mean_size = num_step_failure
         CorrelatedFailure::new(
             num_domain,
+            parameters.num_node,
             mean_size,
             num_step_failure / num_domain as f64 / mean_size as f64,
         )
     });
     // let mut protocol = NopProtocol { n: 12, k: 4 };
-    let mut protocol = RingSuccessorProtocol { n: 24, k: 8 };
+    let mut protocol = RingSuccessorProtocol { n: 12, k: 4 };
 
-    let mut rng = StdRng::seed_from_u64(117418);
-    let mut system = System::new(parameters.clone());
-    system.init(&failure_generator, &mut protocol, &mut rng);
-
-    let mut period = Period(Instant::now());
     // let mut reporter = OverridingLine;
     let csv = Csv {
-        parameters,
+        parameters: parameters.clone(),
         domain_mean_size: mean_size,
         protocol: protocol.name(),
         redundancy: protocol.redundancy(),
+        group_size: protocol.group_size(),
         buf: Default::default(),
     };
     let mut reporter = Merge(OverridingLine, csv);
+
+    let mut rng = StdRng::seed_from_u64(117418);
+    let mut system = System::new(parameters);
+    system.init(&failure_generator, &mut protocol, &mut rng);
+    reporter.report(&system.status());
+
+    let mut period = Period(Instant::now());
     while system.step_count < 1_000_000 && !system.finalized() {
         system.step(&mut protocol, &mut reporter, &mut rng);
         period.run(|| reporter.report(&system.status()))
