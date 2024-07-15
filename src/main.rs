@@ -102,7 +102,12 @@ impl System {
         self.data.is_empty()
     }
 
-    fn step(&mut self, protocol: &mut impl Protocol, rng: &mut impl Rng) {
+    fn step(
+        &mut self,
+        protocol: &mut impl Protocol,
+        reporter: &mut impl Report,
+        rng: &mut impl Rng,
+    ) {
         let at = self
             .scheduled_failures
             .peek()
@@ -139,7 +144,7 @@ impl System {
             self.data
                 .remove(&digest)
                 .expect("data is not lost before failed repair");
-            self.print()
+            reporter.report(&self.status())
         }
         // self.step_count += 1
     }
@@ -184,28 +189,29 @@ impl System {
             .expect("fragment exists");
     }
 
-    fn print(&self) {
-        let num_step_failure = self.failure_count as f32 / self.step_count as f32;
-        let churn = self.failure_count as f32
-            / self.config.num_node as f32
-            // / (self.step_count as f32 / 1000.)
-            / self.step_count as f32
-            * 100.;
-        let redundancy = self
-            .data
-            .values()
-            .map(|fragments| fragments.len())
-            .sum::<usize>() as f32
-            / self.data.len() as f32;
-        eprint!(
-            "{:<120}",
-            format!(
-                "\r[step {:7}] {:3} alive, {num_step_failure:4.2} failures/step ({churn:4.2}% churn), {redundancy:4.2} fragments/data",
-                self.step_count,
-                self.data.len(),
-            )
-        )
+    fn status(&self) -> SystemStatus {
+        SystemStatus {
+            step: self.step_count,
+            num_alive: self.data.len(),
+            num_step_failure: self.failure_count as f32 / self.step_count as f32,
+            churn: self.failure_count as f32 / self.config.num_node as f32 / self.step_count as f32
+                * 100.,
+            redundancy: self
+                .data
+                .values()
+                .map(|fragments| fragments.len())
+                .sum::<usize>() as f32
+                / self.data.len() as f32,
+        }
     }
+}
+
+struct SystemStatus {
+    step: u32,
+    num_alive: usize,
+    num_step_failure: f32,
+    churn: f32,
+    redundancy: f32,
 }
 
 struct NopProtocol {
@@ -340,6 +346,35 @@ impl Period {
     }
 }
 
+trait Report {
+    fn report(&mut self, status: &SystemStatus);
+}
+
+struct OverridingLine;
+
+impl Report for OverridingLine {
+    fn report(&mut self, status: &SystemStatus) {
+        eprint!(
+            "{:<120}",
+            format!(
+                "\r[step {:7}] {:3} alive, {:4.2} failures/step ({:4.2}% churn), {:4.2} fragments/data",
+                status.step,
+                status.num_alive,
+                status.num_step_failure,
+                status.churn,
+                status.redundancy,
+            )
+        )
+    }
+}
+
+impl<F: Report, G: Report> Report for Merge<F, G> {
+    fn report(&mut self, status: &SystemStatus) {
+        self.0.report(status);
+        self.1.report(status)
+    }
+}
+
 fn main() {
     let parameters = SystemParameters {
         num_node: 1_000,
@@ -358,16 +393,18 @@ fn main() {
         )
     });
     // let mut protocol = NopProtocol { n: 12, k: 4 };
-    let mut protocol = RingSuccessorProtocol { n: 12, k: 4 };
+    let mut protocol = RingSuccessorProtocol { n: 24, k: 8 };
 
     let mut rng = StdRng::seed_from_u64(117418);
     let mut system = System::new(parameters);
     system.init(&failure_generator, &mut protocol, &mut rng);
+
     let mut period = Period(Instant::now());
+    let mut reporter = OverridingLine;
     while system.step_count < 1_000_000 && !system.finalized() {
-        system.step(&mut protocol, &mut rng);
-        period.run(|| system.print())
+        system.step(&mut protocol, &mut reporter, &mut rng);
+        period.run(|| reporter.report(&system.status()))
     }
-    system.print();
+    reporter.report(&system.status());
     eprintln!()
 }
