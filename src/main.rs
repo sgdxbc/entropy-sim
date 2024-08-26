@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -12,7 +12,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 type DegreeDistr = WeightedIndex<f64>;
 
 fn main() {
-    let num_node = 100_000;
+    let num_node = 1_000_000;
     let r = 1.6;
 
     let k = (num_node as f32 / r) as usize;
@@ -82,7 +82,9 @@ fn sample_fragment(k: usize, degree_distr: &DegreeDistr, rng: &mut impl Rng) -> 
 }
 
 struct Decoder {
-    buf: Vec<HashSet<usize>>,
+    count: u32,
+    buf: HashMap<u32, HashSet<usize>>,
+    pending: HashMap<usize, HashSet<u32>>,
     received: HashSet<usize>,
     k: usize,
 }
@@ -91,7 +93,9 @@ impl Decoder {
     fn new(k: usize) -> Self {
         Self {
             k,
+            count: 0,
             buf: Default::default(),
+            pending: Default::default(),
             received: Default::default(),
         }
     }
@@ -109,19 +113,23 @@ impl Decoder {
             return;
         }
         if fragment.len() > 1 {
-            self.buf.push(fragment) // dedup?
+            self.count += 1;
+            let id = self.count;
+            for &index in &fragment {
+                self.pending.entry(index).or_default().insert(id);
+            }
+            self.buf.insert(id, fragment); // dedup?
         } else {
             let mut new_received = vec![fragment.into_iter().next().unwrap()];
             while let Some(index) = new_received.pop() {
                 self.received.insert(index);
-                let mut i = 0;
-                while i < self.buf.len() {
-                    self.buf[i].remove(&index);
-                    if self.buf[i].len() == 1 {
-                        let fragment = self.buf.swap_remove(i);
-                        new_received.push(fragment.into_iter().next().unwrap())
-                    } else {
-                        i += 1
+                for id in self.pending.remove(&index).unwrap_or_default() {
+                    if let Some(fragment) = self.buf.get_mut(&id) {
+                        fragment.remove(&index);
+                        if fragment.len() == 1 {
+                            let fragment = self.buf.remove(&id).unwrap();
+                            new_received.extend(fragment)
+                        }
                     }
                 }
             }
