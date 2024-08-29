@@ -4,7 +4,7 @@ use std::{
 };
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use rand_distr::{Distribution, Uniform, WeightedIndex};
+use rand_distr::{Distribution, WeightedIndex};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -76,9 +76,13 @@ fn sample_degree(degree_distr: &DegreeDistr, rng: &mut impl Rng) -> usize {
     degree_distr.sample(rng) + 1
 }
 
-fn sample_fragment(k: usize, degree_distr: &DegreeDistr, rng: &mut impl Rng) -> Vec<usize> {
+fn sample_fragment(k: usize, degree_distr: &DegreeDistr, rng: &mut impl Rng) -> HashSet<usize> {
     let d = sample_degree(degree_distr, rng);
-    Uniform::new(0, k).sample_iter(rng).take(d).collect()
+    let mut fragment = HashSet::new();
+    while fragment.len() < d {
+        fragment.insert(rand_distr::Uniform::new(0, k).sample(rng));
+    }
+    fragment
 }
 
 struct Decoder {
@@ -104,11 +108,8 @@ impl Decoder {
         self.received.len() == self.k
     }
 
-    fn receive(&mut self, fragment: Vec<usize>) {
-        let fragment = fragment
-            .into_iter()
-            .filter(|i| !self.received.contains(i))
-            .collect::<HashSet<_>>();
+    fn receive(&mut self, fragment: HashSet<usize>) {
+        let fragment = &fragment - &self.received;
         if fragment.is_empty() {
             return;
         }
