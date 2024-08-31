@@ -27,12 +27,16 @@ fn main() {
     // let k = 32 * 10_000;
     // let k = 16 * 10_000;
     let r = 1.6;
+    // let r = 2.;
+    // let r = 2.4;
     let parameters = SystemParameters {
         num_initial_node: num_node,
         enter_rate: 0.01, // node/step, not % node
         leave_rate: 0.01,
         target_redundancy: r,
         num_chunk: k,
+        // num_data: 400,
+        // num_data: 200,
         num_data: 100,
     };
 
@@ -45,12 +49,14 @@ fn main() {
     system.init(&mut rng);
     eprintln!("{}", system.report());
     let mut period = Period(Instant::now());
-    while system.now < 1_000_000_000 {
+    // while system.now < 1_000_000_000 {
+    while system.now < 10_000_000 {
         system.step(&mut rng);
-        period.run(|| eprint!("{:80}\r", system.report()))
+        period.run(|| eprint!("{:120}\r", system.report()))
     }
-    eprint!("{:80}\r", system.report());
-    eprintln!()
+    eprint!("{:120}\r", system.report());
+    eprintln!();
+    dump_load(&system)
 }
 
 fn dump_degree(system: &System) {
@@ -62,6 +68,21 @@ fn dump_degree(system: &System) {
         .collect::<Vec<_>>()
         .join("\n");
     let name = format!("degree-{}", Local::now().format("%y%m%d%H%M%S"));
+    let path = Path::new("data").join(name).with_extension("csv");
+    write(path, lines).expect("write results to file");
+}
+
+fn dump_load(system: &System) {
+    let mut lines = String::new();
+    for (i, load) in system.storage_loads.iter().enumerate() {
+        writeln!(
+            &mut lines,
+            "{},{i},{load:.2}",
+            system.parameters.comma_separated()
+        )
+        .expect("can write")
+    }
+    let name = format!("load-{}", Local::now().format("%y%m%d%H%M%S"));
     let path = Path::new("data").join(name).with_extension("csv");
     write(path, lines).expect("write results to file");
 }
@@ -82,12 +103,13 @@ struct SystemParameters {
 impl SystemParameters {
     fn comma_separated(&self) -> String {
         format!(
-            "{},{},{},{},{}",
+            "{},{},{},{},{},{}",
             self.num_initial_node,
             self.enter_rate,
             self.leave_rate,
             self.target_redundancy,
-            self.num_chunk
+            self.num_chunk,
+            self.num_data,
         )
     }
 }
@@ -109,11 +131,23 @@ struct System {
 
     num_node_enter: u32,
     num_node_leave: u32,
+    storage_loads: Vec<f32>,
 }
 
 #[derive(Debug, Default)]
 struct Node {
     packets: HashMap<DataId, Vec<Packet>>,
+}
+
+impl Node {
+    // in the unit of chunk size i.e. (1 / num_chunk) unit size
+    // 1 unit size = the size of 1 data
+    fn storage_size(&self) -> usize {
+        self.packets
+            .values()
+            .map(|packets| packets.iter().sum::<usize>())
+            .sum()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -133,26 +167,17 @@ impl System {
             nodes: Default::default(),
             num_node_enter: 0,
             num_node_leave: 0,
+            storage_loads: Default::default(),
         }
     }
 
     fn init(&mut self, rng: &mut impl Rng) {
-        self.nodes
-            .extend(repeat_with(Node::default).take(self.parameters.num_initial_node));
         // a bit unrealistic here: initialize the system by assuming perfect scale estimation by
         // every initial node
         let num_node_packet = self.parameters.num_chunk as f64 * self.parameters.target_redundancy
             / self.parameters.num_initial_node as f64;
-        for data_id in 0..self.parameters.num_data {
-            for node in &mut self.nodes {
-                let mut packets = repeat_with(|| self.packet_distr.sample(rng))
-                    .take(num_node_packet.floor() as _)
-                    .collect::<Vec<_>>();
-                if rng.gen_bool(num_node_packet.fract()) {
-                    packets.push(self.packet_distr.sample(rng))
-                }
-                node.packets.insert(data_id as _, packets);
-            }
+        for _ in 0..self.parameters.num_initial_node {
+            self.push_node(rng, num_node_packet)
         }
         self.push_node_enter_event(rng);
         self.push_node_leave_event(rng)
@@ -166,11 +191,12 @@ impl System {
         match event {
             NodeEnter => {
                 self.num_node_enter += 1;
-                // TODO
-                let node = Node {
-                    packets: Default::default(),
-                };
-                self.nodes.push(node);
+
+                // TODO introduce estimation error
+                let num_node_packet = self.parameters.num_chunk as f64
+                    * self.parameters.target_redundancy
+                    / self.nodes.len() as f64;
+                self.push_node(rng, num_node_packet);
                 self.push_node_enter_event(rng)
             }
             NodeLeave => {
@@ -180,6 +206,23 @@ impl System {
                 self.push_node_leave_event(rng)
             }
         }
+    }
+
+    fn push_node(&mut self, rng: &mut impl Rng, num_node_packet: f64) {
+        let mut packets = HashMap::new();
+        for data_id in 0..self.parameters.num_data {
+            let mut data_packets = repeat_with(|| self.packet_distr.sample(rng))
+                .take(num_node_packet.floor() as _)
+                .collect::<Vec<_>>();
+            if rng.gen_bool(num_node_packet.fract()) {
+                data_packets.push(self.packet_distr.sample(rng))
+            }
+            packets.insert(data_id as DataId, data_packets);
+        }
+        let node = Node { packets };
+        self.storage_loads
+            .push(node.storage_size() as f32 / self.parameters.num_chunk as f32);
+        self.nodes.push(node);
     }
 
     fn report(&self) -> String {
@@ -194,29 +237,25 @@ impl System {
             })
             .sum::<usize>();
         let num_data_packet = num_packets as f32 / self.parameters.num_data as f32;
-        // in the unit of chunk size i.e. (1 / num_chunk) unit size
-        // 1 unit size = the size of 1 data
         let storage_size = self
             .nodes
             .iter()
-            .map(|node| {
-                node.packets
-                    .values()
-                    // .map(|packets| packets.iter().map(|packet| packet.len()).sum::<usize>())
-                    .map(|packets| packets.iter().sum::<usize>())
-                    .sum::<usize>()
-            })
+            .map(|node| node.storage_size())
             .sum::<usize>();
         format!(
-            "[{:>10}] {} node(s) {:.2}%/{:.2}% enter/leave (per kStep) {:.2} packet/data {:.2} logical redundant {:.2} degree {:.2} real redundant",
+            concat!(
+                "[{:>10}] {} node(s) {:.2}%/{:.2}% enter/leave (per kStep) {:.2}/{:.2} logical/real redundant {:.2} degree",
+                " {:.2} average load"),
             self.now,
             self.nodes.len(),
             self.num_node_enter as f32 / (self.now as f32 / 1000.) / self.nodes.len() as f32 * 100.,
             self.num_node_leave as f32 / (self.now as f32 / 1000.) / self.nodes.len() as f32 * 100.,
-            num_data_packet,
             num_data_packet / self.parameters.num_chunk as f32,
+            storage_size as f32
+                / self.parameters.num_chunk as f32
+                / self.parameters.num_data as f32,
             storage_size as f32 / num_packets as f32,
-            storage_size as f32 / self.parameters.num_data as f32 / self.parameters.num_chunk as f32,
+            storage_size as f32 / self.parameters.num_chunk as f32 / self.nodes.len() as f32,
         )
     }
 
