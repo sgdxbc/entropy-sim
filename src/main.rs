@@ -6,7 +6,7 @@ use std::{
 };
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use rand_distr::{Distribution, Exp, WeightedIndex};
+use rand_distr::{Distribution, Exp, Uniform, WeightedIndex};
 
 #[allow(unused)]
 mod decoder;
@@ -14,18 +14,17 @@ mod decoder;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-type DegreeDistr = WeightedIndex<f64>;
-
 fn main() {
     let num_node = 100_000;
-    let num_node_packet = 10;
+    // 640K chunks per data, 64GB data = 100KB chunk, 1GB data = 1.6KB chunk
+    let k = 64 * 10_000;
     let r = 1.6;
     let parameters = SystemParameters {
         num_initial_node: num_node,
         enter_rate: 1., // node/step, not % node
         leave_rate: 1.,
         target_redundancy: r,
-        num_node_packet,
+        num_chunk: k,
     };
 
     let mut rng = StdRng::seed_from_u64(117418);
@@ -40,56 +39,6 @@ fn main() {
     eprintln!()
 }
 
-struct Period(Instant);
-
-impl Period {
-    fn run(&mut self, task: impl FnOnce()) {
-        if self.0.elapsed() > Duration::from_secs(1) {
-            task();
-            self.0 = Instant::now()
-        }
-    }
-}
-
-fn p_degree_ideal(k: usize) -> Vec<f64> {
-    let mut ps = vec![1. / k as f64];
-    for i in 2..=k {
-        ps.push(1. / (i * (i - 1)) as f64)
-    }
-    ps
-}
-
-fn p_degree(k: usize) -> Vec<f64> {
-    let delta = 0.5;
-    let c = 0.01;
-
-    let mut tau = p_degree_ideal(k);
-    let k = k as f64;
-    let s = c * (k / delta).ln() * k.sqrt();
-    for (i, p) in tau.iter_mut().enumerate() {
-        let d = (i + 1) as f64;
-        if d == (k / s).floor() {
-            *p += s / k * (s / delta).ln();
-            break;
-        }
-        *p += s / k * (1. / d)
-    }
-    tau
-}
-
-fn sample_degree(degree_distr: &DegreeDistr, rng: &mut impl Rng) -> usize {
-    degree_distr.sample(rng) + 1
-}
-
-fn sample_fragment(k: usize, degree_distr: &DegreeDistr, rng: &mut impl Rng) -> HashSet<usize> {
-    let d = sample_degree(degree_distr, rng);
-    let mut fragment = HashSet::new();
-    while fragment.len() < d {
-        fragment.insert(rand_distr::Uniform::new(0, k).sample(rng));
-    }
-    fragment
-}
-
 #[derive(Debug)]
 struct SystemParameters {
     // network
@@ -98,7 +47,7 @@ struct SystemParameters {
     leave_rate: f64,
     // protocol
     target_redundancy: f64, // > 1, tolerate (1 - 1 / _) portion of faulty nodes
-    num_node_packet: usize,
+    num_chunk: usize,       // k
 }
 
 type Step = u32;
@@ -109,8 +58,7 @@ type Packet = HashSet<ChunkId>; // need DataId as well?
 #[derive(Debug)]
 struct System {
     parameters: SystemParameters,
-    k: usize,
-    degree_distr: DegreeDistr,
+    packet_distr: PacketDistr,
 
     now: Step,
     events: BinaryHeap<Reverse<(Step, Event)>>,
@@ -133,13 +81,10 @@ enum Event {
 
 impl System {
     fn new(parameters: SystemParameters) -> Self {
-        let k = ((parameters.num_initial_node * parameters.num_node_packet) as f64
-            / parameters.target_redundancy) as _;
-        let degree_distr = WeightedIndex::new(p_degree(k)).expect("valid weights");
+        let packet_distr = PacketDistr::new(parameters.num_chunk);
         Self {
             parameters,
-            k,
-            degree_distr,
+            packet_distr,
             now: 0,
             events: Default::default(),
             nodes: Default::default(),
@@ -211,5 +156,63 @@ impl System {
             .sample(rng)
             .ceil() as _;
         self.push_event(after, Event::NodeLeave)
+    }
+}
+
+struct Period(Instant);
+
+impl Period {
+    fn run(&mut self, task: impl FnOnce()) {
+        if self.0.elapsed() > Duration::from_secs(1) {
+            task();
+            self.0 = Instant::now()
+        }
+    }
+}
+
+fn p_degree_ideal(k: usize) -> Vec<f64> {
+    let mut ps = vec![1. / k as f64];
+    for i in 2..=k {
+        ps.push(1. / (i * (i - 1)) as f64)
+    }
+    ps
+}
+
+fn p_degree(k: usize) -> Vec<f64> {
+    let delta = 0.5;
+    let c = 0.01;
+
+    let mut tau = p_degree_ideal(k);
+    let k = k as f64;
+    let s = c * (k / delta).ln() * k.sqrt();
+    for (i, p) in tau.iter_mut().enumerate() {
+        let d = (i + 1) as f64;
+        if d == (k / s).floor() {
+            *p += s / k * (s / delta).ln();
+            break;
+        }
+        *p += s / k * (1. / d)
+    }
+    tau
+}
+
+#[derive(Debug)]
+struct PacketDistr(WeightedIndex<f64>, Uniform<u32>);
+
+impl PacketDistr {
+    fn new(k: usize) -> Self {
+        Self(
+            WeightedIndex::new(p_degree(k)).expect("valid weights"),
+            Uniform::new(0, k as u32),
+        )
+    }
+
+    fn sample(&self, rng: &mut impl Rng) -> Packet {
+        let d = self.0.sample(rng) + 1;
+        let mut fragment = HashSet::new();
+        while fragment.len() < d {
+            fragment.insert(self.1.sample(rng));
+        }
+        fragment
     }
 }
