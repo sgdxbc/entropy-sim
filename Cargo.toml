@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rand = "0.8.5"
-rand_distr = "0.4.3"
+chrono = "0.4.38"
+rand = "0.9.0-alpha"
+rand_distr = "0.5.0-alpha"
 rustc-hash = "2.0.0"
 tikv-jemallocator = "0.5.4"

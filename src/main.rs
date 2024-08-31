@@ -1,10 +1,15 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
+    env::args,
+    fmt::Write,
+    fs::write,
     iter::repeat_with,
+    path::Path,
     time::{Duration, Instant},
 };
 
+use chrono::Local;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::{Distribution, Exp, Uniform, WeightedIndex};
 
@@ -17,6 +22,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 fn main() {
     let num_node = 100_000;
     // 640K chunks per data, 64GB data = 100KB chunk, 1GB data = 1.6KB chunk
+    // the robust soliton distribution "bursts" at 5688 i.e. 568.8MB storage overhead for 64GB data
     let k = 64 * 10_000;
     let r = 1.6;
     let parameters = SystemParameters {
@@ -27,8 +33,21 @@ fn main() {
         num_chunk: k,
     };
 
-    let mut rng = StdRng::seed_from_u64(117418);
     let mut system = System::new(parameters);
+    if args().nth(1).as_deref() == Some("dump-degree") {
+        let mut lines = String::new();
+        system.packet_distr.write_degree_distr(&mut lines);
+        let lines = lines
+            .lines()
+            .map(|line| system.parameters.comma_separated() + "," + line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let name = format!("degree-{}", Local::now().format("%y%m%d%H%M%S"));
+        let path = Path::new("data").join(name).with_extension("csv");
+        write(path, lines).expect("write results to file");
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(117418);
     system.init(&mut rng);
     let mut period = Period(Instant::now());
     while system.now < 1_000_000_000 {
@@ -48,6 +67,19 @@ struct SystemParameters {
     // protocol
     target_redundancy: f64, // > 1, tolerate (1 - 1 / _) portion of faulty nodes
     num_chunk: usize,       // k
+}
+
+impl SystemParameters {
+    fn comma_separated(&self) -> String {
+        format!(
+            "{},{},{},{},{}",
+            self.num_initial_node,
+            self.enter_rate,
+            self.leave_rate,
+            self.target_redundancy,
+            self.num_chunk
+        )
+    }
 }
 
 type Step = u32;
@@ -159,17 +191,6 @@ impl System {
     }
 }
 
-struct Period(Instant);
-
-impl Period {
-    fn run(&mut self, task: impl FnOnce()) {
-        if self.0.elapsed() > Duration::from_secs(1) {
-            task();
-            self.0 = Instant::now()
-        }
-    }
-}
-
 fn p_degree_ideal(k: usize) -> Vec<f64> {
     let mut ps = vec![1. / k as f64];
     for i in 2..=k {
@@ -185,6 +206,7 @@ fn p_degree(k: usize) -> Vec<f64> {
     let mut tau = p_degree_ideal(k);
     let k = k as f64;
     let s = c * (k / delta).ln() * k.sqrt();
+    eprintln!("k {k} s {s} k/s {}", (k / s).floor());
     for (i, p) in tau.iter_mut().enumerate() {
         let d = (i + 1) as f64;
         if d == (k / s).floor() {
@@ -203,7 +225,7 @@ impl PacketDistr {
     fn new(k: usize) -> Self {
         Self(
             WeightedIndex::new(p_degree(k)).expect("valid weights"),
-            Uniform::new(0, k as u32),
+            Uniform::new(0, k as u32).expect("valid range"),
         )
     }
 
@@ -214,5 +236,22 @@ impl PacketDistr {
             fragment.insert(self.1.sample(rng));
         }
         fragment
+    }
+
+    fn write_degree_distr(&self, mut write: impl Write) {
+        for (i, weight) in self.0.weights().enumerate() {
+            writeln!(&mut write, "{},{}", i + 1, weight / self.0.total_weight()).expect("can write")
+        }
+    }
+}
+
+struct Period(Instant);
+
+impl Period {
+    fn run(&mut self, task: impl FnOnce()) {
+        if self.0.elapsed() > Duration::from_secs(1) {
+            task();
+            self.0 = Instant::now()
+        }
     }
 }
