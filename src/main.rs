@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap},
     env::args,
     fmt::Write,
     fs::write,
@@ -29,28 +29,21 @@ fn main() {
     let r = 1.6;
     let parameters = SystemParameters {
         num_initial_node: num_node,
-        enter_rate: 1., // node/step, not % node
-        leave_rate: 1.,
+        enter_rate: 0.01, // node/step, not % node
+        leave_rate: 0.01,
         target_redundancy: r,
         num_chunk: k,
+        num_data: 100,
     };
 
     let mut system = System::new(parameters);
     if args().nth(1).as_deref() == Some("dump-degree") {
-        let mut lines = String::new();
-        system.packet_distr.write_degree_distr(&mut lines);
-        let lines = lines
-            .lines()
-            .map(|line| system.parameters.comma_separated() + "," + line)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let name = format!("degree-{}", Local::now().format("%y%m%d%H%M%S"));
-        let path = Path::new("data").join(name).with_extension("csv");
-        write(path, lines).expect("write results to file");
+        dump_degree(&system);
         return;
     }
     let mut rng = StdRng::seed_from_u64(117418);
     system.init(&mut rng);
+    eprintln!("{}", system.report());
     let mut period = Period(Instant::now());
     while system.now < 1_000_000_000 {
         system.step(&mut rng);
@@ -58,6 +51,19 @@ fn main() {
     }
     eprint!("{:80}\r", system.report());
     eprintln!()
+}
+
+fn dump_degree(system: &System) {
+    let mut lines = String::new();
+    system.packet_distr.write_degree_distr(&mut lines);
+    let lines = lines
+        .lines()
+        .map(|line| system.parameters.comma_separated() + "," + line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let name = format!("degree-{}", Local::now().format("%y%m%d%H%M%S"));
+    let path = Path::new("data").join(name).with_extension("csv");
+    write(path, lines).expect("write results to file");
 }
 
 #[derive(Debug)]
@@ -69,6 +75,8 @@ struct SystemParameters {
     // protocol
     target_redundancy: f64, // > 1, tolerate (1 - 1 / _) portion of faulty nodes
     num_chunk: usize,       // k
+    // workload
+    num_data: usize,
 }
 
 impl SystemParameters {
@@ -87,7 +95,8 @@ impl SystemParameters {
 type Step = u32;
 type DataId = u32;
 type ChunkId = u32;
-type Packet = HashSet<ChunkId>; // need DataId as well?
+// type Packet = HashSet<ChunkId>; // need back reference to DataId?
+type Packet = usize; // the degree of packet
 
 #[derive(Debug)]
 struct System {
@@ -130,6 +139,21 @@ impl System {
     fn init(&mut self, rng: &mut impl Rng) {
         self.nodes
             .extend(repeat_with(Node::default).take(self.parameters.num_initial_node));
+        // a bit unrealistic here: initialize the system by assuming perfect scale estimation by
+        // every initial node
+        let num_node_packet = self.parameters.num_chunk as f64 * self.parameters.target_redundancy
+            / self.parameters.num_initial_node as f64;
+        for data_id in 0..self.parameters.num_data {
+            for node in &mut self.nodes {
+                let mut packets = repeat_with(|| self.packet_distr.sample(rng))
+                    .take(num_node_packet.floor() as _)
+                    .collect::<Vec<_>>();
+                if rng.gen_bool(num_node_packet.fract()) {
+                    packets.push(self.packet_distr.sample(rng))
+                }
+                node.packets.insert(data_id as _, packets);
+            }
+        }
         self.push_node_enter_event(rng);
         self.push_node_leave_event(rng)
     }
@@ -159,12 +183,40 @@ impl System {
     }
 
     fn report(&self) -> String {
+        let num_packets = self
+            .nodes
+            .iter()
+            .map(|node| {
+                node.packets
+                    .values()
+                    .map(|packets| packets.len())
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        let num_data_packet = num_packets as f32 / self.parameters.num_data as f32;
+        // in the unit of chunk size i.e. (1 / num_chunk) unit size
+        // 1 unit size = the size of 1 data
+        let storage_size = self
+            .nodes
+            .iter()
+            .map(|node| {
+                node.packets
+                    .values()
+                    // .map(|packets| packets.iter().map(|packet| packet.len()).sum::<usize>())
+                    .map(|packets| packets.iter().sum::<usize>())
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
         format!(
-            "[{:>8}] {} node(s) {:.2}% enter/kStep {:.2}% leave/kStep",
+            "[{:>10}] {} node(s) {:.2}%/{:.2}% enter/leave (per kStep) {:.2} packet/data {:.2} logical redundant {:.2} degree {:.2} real redundant",
             self.now,
             self.nodes.len(),
-            self.num_node_enter as f32 / (self.now as f32 / 1000.) * 100.,
-            self.num_node_leave as f32 / (self.now as f32 / 1000.) * 100.,
+            self.num_node_enter as f32 / (self.now as f32 / 1000.) / self.nodes.len() as f32 * 100.,
+            self.num_node_leave as f32 / (self.now as f32 / 1000.) / self.nodes.len() as f32 * 100.,
+            num_data_packet,
+            num_data_packet / self.parameters.num_chunk as f32,
+            storage_size as f32 / num_packets as f32,
+            storage_size as f32 / self.parameters.num_data as f32 / self.parameters.num_chunk as f32,
         )
     }
 
@@ -177,7 +229,7 @@ impl System {
     }
 
     fn push_node_enter_event(&mut self, rng: &mut impl Rng) {
-        let after = Exp::new(self.parameters.enter_rate / self.nodes.len() as f64)
+        let after = Exp::new(self.parameters.enter_rate)
             .expect("valid parameter")
             .sample(rng)
             .ceil() as _;
@@ -185,7 +237,7 @@ impl System {
     }
 
     fn push_node_leave_event(&mut self, rng: &mut impl Rng) {
-        let after = Exp::new(self.parameters.leave_rate / self.nodes.len() as f64)
+        let after = Exp::new(self.parameters.leave_rate)
             .expect("valid parameter")
             .sample(rng)
             .ceil() as _;
@@ -233,11 +285,12 @@ impl PacketDistr {
 
     fn sample(&self, rng: &mut impl Rng) -> Packet {
         let d = self.0.sample(rng) + 1;
-        let mut fragment = HashSet::new();
-        while fragment.len() < d {
-            fragment.insert(self.1.sample(rng));
-        }
-        fragment
+        // let mut fragment = HashSet::new();
+        // while fragment.len() < d {
+        //     fragment.insert(self.1.sample(rng));
+        // }
+        // fragment
+        d
     }
 
     fn write_degree_distr(&self, mut write: impl Write) {
