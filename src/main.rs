@@ -8,6 +8,9 @@ use std::{
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::{Distribution, Exp, WeightedIndex};
 
+#[allow(unused)]
+mod decoder;
+
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -19,20 +22,17 @@ fn main() {
     let r = 1.6;
     let parameters = SystemParameters {
         num_initial_node: num_node,
-        enter_rate: 0.1,
-        leave_rate: 0.1,
+        enter_rate: 1., // node/step, not % node
+        leave_rate: 1.,
+        target_redundancy: r,
+        num_node_packet,
     };
 
-    let k = ((num_node * num_node_packet) as f32 / r) as usize;
-    println!("k = {k}");
-    // let degree_distr = WeightedIndex::new(p_degree(k)).expect("valid weights");
     let mut rng = StdRng::seed_from_u64(117418);
-    // let mut decoder = Decoder::new(k);
-
     let mut system = System::new(parameters);
     system.init(&mut rng);
     let mut period = Period(Instant::now());
-    while system.now < 10_000_000 {
+    while system.now < 1_000_000_000 {
         system.step(&mut rng);
         period.run(|| eprint!("{:80}\r", system.report()))
     }
@@ -90,64 +90,15 @@ fn sample_fragment(k: usize, degree_distr: &DegreeDistr, rng: &mut impl Rng) -> 
     fragment
 }
 
-struct Decoder {
-    count: u32,
-    buf: HashMap<u32, HashSet<usize>>,
-    pending: HashMap<usize, HashSet<u32>>,
-    received: HashSet<usize>,
-    k: usize,
-}
-
-impl Decoder {
-    fn new(k: usize) -> Self {
-        Self {
-            k,
-            count: 0,
-            buf: Default::default(),
-            pending: Default::default(),
-            received: Default::default(),
-        }
-    }
-
-    fn recovered(&self) -> bool {
-        self.received.len() == self.k
-    }
-
-    fn receive(&mut self, fragment: HashSet<usize>) {
-        let fragment = &fragment - &self.received;
-        if fragment.is_empty() {
-            return;
-        }
-        if fragment.len() > 1 {
-            self.count += 1;
-            let id = self.count;
-            for &index in &fragment {
-                self.pending.entry(index).or_default().insert(id);
-            }
-            self.buf.insert(id, fragment); // dedup?
-        } else {
-            let mut new_received = vec![fragment.into_iter().next().unwrap()];
-            while let Some(index) = new_received.pop() {
-                self.received.insert(index);
-                for id in self.pending.remove(&index).unwrap_or_default() {
-                    if let Some(fragment) = self.buf.get_mut(&id) {
-                        fragment.remove(&index);
-                        if fragment.len() == 1 {
-                            let fragment = self.buf.remove(&id).unwrap();
-                            new_received.extend(fragment)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 struct SystemParameters {
+    // network
     num_initial_node: usize,
     enter_rate: f64,
     leave_rate: f64,
+    // protocol
+    target_redundancy: f64, // > 1, tolerate (1 - 1 / _) portion of faulty nodes
+    num_node_packet: usize,
 }
 
 type Step = u32;
@@ -158,6 +109,9 @@ type Packet = HashSet<ChunkId>; // need DataId as well?
 #[derive(Debug)]
 struct System {
     parameters: SystemParameters,
+    k: usize,
+    degree_distr: DegreeDistr,
+
     now: Step,
     events: BinaryHeap<Reverse<(Step, Event)>>,
     nodes: Vec<Node>,
@@ -179,12 +133,16 @@ enum Event {
 
 impl System {
     fn new(parameters: SystemParameters) -> Self {
+        let k = ((parameters.num_initial_node * parameters.num_node_packet) as f64
+            / parameters.target_redundancy) as _;
+        let degree_distr = WeightedIndex::new(p_degree(k)).expect("valid weights");
         Self {
             parameters,
+            k,
+            degree_distr,
             now: 0,
             events: Default::default(),
             nodes: Default::default(),
-
             num_node_enter: 0,
             num_node_leave: 0,
         }
@@ -199,6 +157,7 @@ impl System {
 
     fn step(&mut self, rng: &mut impl Rng) {
         let Reverse((at, event)) = self.events.pop().expect("events not exhausted");
+        assert!(at >= self.now);
         self.now = at;
         use Event::*;
         match event {
@@ -222,20 +181,24 @@ impl System {
 
     fn report(&self) -> String {
         format!(
-            "[{:>8}] {} node(s) {:.2}% enter/step {:.2}% leave/step",
+            "[{:>8}] {} node(s) {:.2}% enter/kStep {:.2}% leave/kStep",
             self.now,
             self.nodes.len(),
-            self.num_node_enter as f32 / self.now as f32 * 100.,
-            self.num_node_leave as f32 / self.now as f32 * 100.,
+            self.num_node_enter as f32 / (self.now as f32 / 1000.) * 100.,
+            self.num_node_leave as f32 / (self.now as f32 / 1000.) * 100.,
         )
     }
 
     fn push_event(&mut self, after: Step, event: Event) {
-        self.events.push(Reverse((self.now + after, event)))
+        let Some(at) = self.now.checked_add(after) else {
+            eprintln!("Timestamp overflow {event:?}");
+            return;
+        };
+        self.events.push(Reverse((at, event)))
     }
 
     fn push_node_enter_event(&mut self, rng: &mut impl Rng) {
-        let after = Exp::new(self.parameters.enter_rate)
+        let after = Exp::new(self.parameters.enter_rate / self.nodes.len() as f64)
             .expect("valid parameter")
             .sample(rng)
             .ceil() as _;
@@ -243,7 +206,7 @@ impl System {
     }
 
     fn push_node_leave_event(&mut self, rng: &mut impl Rng) {
-        let after = Exp::new(self.parameters.leave_rate)
+        let after = Exp::new(self.parameters.leave_rate / self.nodes.len() as f64)
             .expect("valid parameter")
             .sample(rng)
             .ceil() as _;
