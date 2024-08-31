@@ -24,6 +24,8 @@ fn main() {
     // 640K chunks per data, 64GB data = 100KB chunk, 1GB data = 1.6KB chunk
     // the robust soliton distribution "bursts" at 5688 i.e. 568.8MB storage overhead for 64GB data
     let k = 64 * 10_000;
+    // let k = 32 * 10_000;
+    // let k = 16 * 10_000;
     let r = 1.6;
     let parameters = SystemParameters {
         num_initial_node: num_node,
