@@ -31,10 +31,12 @@ fn main() {
     // let r = 2.4;
     let parameters = SystemParameters {
         num_initial_node: num_node,
-        enter_rate: 0.01, // node/step, not % node
+        // enter_rate: 0.01, // node/step, not % node
+        enter_rate: 0.02,
         leave_rate: 0.01,
         target_redundancy: r,
         num_chunk: k,
+        num_checkpoint_step: 10_000,
         // num_data: 400,
         // num_data: 200,
         num_data: 100,
@@ -56,7 +58,12 @@ fn main() {
     }
     eprint!("{:120}\r", system.report());
     eprintln!();
-    dump_load(&system)
+    if args().nth(1).as_deref() == Some("dump-load") {
+        dump_load(&system)
+    }
+    if args().nth(1).as_deref() == Some("dump-checkpoint") {
+        dump_checkpoint(&system)
+    }
 }
 
 fn dump_degree(system: &System) {
@@ -87,6 +94,24 @@ fn dump_load(system: &System) {
     write(path, lines).expect("write results to file");
 }
 
+fn dump_checkpoint(system: &System) {
+    let mut lines = String::new();
+    for checkpoint in &system.checkpoints {
+        writeln!(
+            &mut lines,
+            "{},{},{},{:.2}",
+            system.parameters.comma_separated(),
+            checkpoint.at,
+            checkpoint.num_node,
+            checkpoint.redundancy,
+        )
+        .expect("can write")
+    }
+    let name = format!("checkpoint-{}", Local::now().format("%y%m%d%H%M%S"));
+    let path = Path::new("data").join(name).with_extension("csv");
+    write(path, lines).expect("write results to file");
+}
+
 #[derive(Debug)]
 struct SystemParameters {
     // network
@@ -96,6 +121,7 @@ struct SystemParameters {
     // protocol
     target_redundancy: f64, // > 1, tolerate (1 - 1 / _) portion of faulty nodes
     num_chunk: usize,       // k
+    num_checkpoint_step: u32,
     // workload
     num_data: usize,
 }
@@ -103,12 +129,13 @@ struct SystemParameters {
 impl SystemParameters {
     fn comma_separated(&self) -> String {
         format!(
-            "{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{}",
             self.num_initial_node,
             self.enter_rate,
             self.leave_rate,
             self.target_redundancy,
             self.num_chunk,
+            self.num_checkpoint_step,
             self.num_data,
         )
     }
@@ -116,6 +143,7 @@ impl SystemParameters {
 
 type Step = u32;
 type DataId = u32;
+#[allow(unused)]
 type ChunkId = u32;
 // type Packet = HashSet<ChunkId>; // need back reference to DataId?
 type Packet = usize; // the degree of packet
@@ -132,11 +160,19 @@ struct System {
     num_node_enter: u32,
     num_node_leave: u32,
     storage_loads: Vec<f32>,
+    checkpoints: Vec<Checkpoint>,
 }
 
 #[derive(Debug, Default)]
 struct Node {
     packets: HashMap<DataId, Vec<Packet>>,
+}
+
+#[derive(Debug)]
+struct Checkpoint {
+    at: Step,
+    num_node: usize,
+    redundancy: f32,
 }
 
 impl Node {
@@ -168,6 +204,7 @@ impl System {
             num_node_enter: 0,
             num_node_leave: 0,
             storage_loads: Default::default(),
+            checkpoints: Default::default(),
         }
     }
 
@@ -179,6 +216,7 @@ impl System {
         for _ in 0..self.parameters.num_initial_node {
             self.push_node(rng, num_node_packet)
         }
+        self.push_checkpoint();
         self.push_node_enter_event(rng);
         self.push_node_leave_event(rng)
     }
@@ -197,12 +235,14 @@ impl System {
                     * self.parameters.target_redundancy
                     / self.nodes.len() as f64;
                 self.push_node(rng, num_node_packet);
+                self.push_checkpoint();
                 self.push_node_enter_event(rng)
             }
             NodeLeave => {
                 self.num_node_leave += 1;
-                // TODO
+                //
                 self.nodes.swap_remove(rng.gen_range(0..self.nodes.len()));
+                self.push_checkpoint();
                 self.push_node_leave_event(rng)
             }
         }
@@ -225,6 +265,23 @@ impl System {
         self.nodes.push(node);
     }
 
+    fn push_checkpoint(&mut self) {
+        if let Some(checkpoint) = self.checkpoints.last() {
+            if checkpoint.at + self.parameters.num_checkpoint_step >= self.now {
+                return;
+            }
+        }
+        // eprintln!("checkpoint at {}", self.now);
+        let checkpoint = Checkpoint {
+            at: self.now,
+            num_node: self.nodes.len(),
+            redundancy: self.storage_size() as f32
+                / self.parameters.num_chunk as f32
+                / self.parameters.num_data as f32,
+        };
+        self.checkpoints.push(checkpoint)
+    }
+
     fn report(&self) -> String {
         let num_packets = self
             .nodes
@@ -237,11 +294,7 @@ impl System {
             })
             .sum::<usize>();
         let num_data_packet = num_packets as f32 / self.parameters.num_data as f32;
-        let storage_size = self
-            .nodes
-            .iter()
-            .map(|node| node.storage_size())
-            .sum::<usize>();
+        let storage_size = self.storage_size();
         format!(
             concat!(
                 "[{:>10}] {} node(s) {:.2}%/{:.2}% enter/leave (per kStep) {:.2}/{:.2} logical/real redundant {:.2} degree",
@@ -257,6 +310,13 @@ impl System {
             storage_size as f32 / num_packets as f32,
             storage_size as f32 / self.parameters.num_chunk as f32 / self.nodes.len() as f32,
         )
+    }
+
+    fn storage_size(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| node.storage_size())
+            .sum::<usize>()
     }
 
     fn push_event(&mut self, after: Step, event: Event) {
@@ -312,7 +372,7 @@ fn p_degree(k: usize) -> Vec<f64> {
 }
 
 #[derive(Debug)]
-struct PacketDistr(WeightedIndex<f64>, Uniform<u32>);
+struct PacketDistr(WeightedIndex<f64>, #[allow(unused)] Uniform<u32>);
 
 impl PacketDistr {
     fn new(k: usize) -> Self {
@@ -322,14 +382,17 @@ impl PacketDistr {
         )
     }
 
+    // fn sample(&self, rng: &mut impl Rng) -> Packet {
+    //     let d = self.0.sample(rng) + 1;
+    //     let mut fragment = HashSet::new();
+    //     while fragment.len() < d {
+    //         fragment.insert(self.1.sample(rng));
+    //     }
+    //     fragment
+    // }
+
     fn sample(&self, rng: &mut impl Rng) -> Packet {
-        let d = self.0.sample(rng) + 1;
-        // let mut fragment = HashSet::new();
-        // while fragment.len() < d {
-        //     fragment.insert(self.1.sample(rng));
-        // }
-        // fragment
-        d
+        self.0.sample(rng) + 1
     }
 
     fn write_degree_distr(&self, mut write: impl Write) {
