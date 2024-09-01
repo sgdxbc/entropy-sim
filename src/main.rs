@@ -36,7 +36,9 @@ fn main() {
         leave_rate: 0.01,
         target_redundancy: r,
         num_chunk: k,
-        num_census_step: None,
+        // num_census_step: None,
+        // num_census_step: Some(1_000_000),
+        num_census_step: Some(10_000),
         num_checkpoint_step: 100_000,
         // num_data: 400,
         // num_data: 200,
@@ -152,6 +154,7 @@ type DataId = u32;
 type ChunkId = u32;
 // type Packet = HashSet<ChunkId>; // need back reference to DataId?
 type Packet = usize; // the degree of packet
+type NodeId = u32;
 
 #[derive(Debug)]
 struct System {
@@ -161,6 +164,7 @@ struct System {
     now: Step,
     events: BinaryHeap<Reverse<(Step, Event)>>,
     nodes: Vec<Node>,
+    node_id_count: NodeId,
 
     num_node_enter: u32,
     num_node_leave: u32,
@@ -170,6 +174,7 @@ struct System {
 
 #[derive(Debug, Default)]
 struct Node {
+    id: NodeId,
     packets: HashMap<DataId, Vec<Packet>>,
 }
 
@@ -195,6 +200,7 @@ impl Node {
 enum Event {
     NodeEnter,
     NodeLeave,
+    AdjustRedundancy(usize, NodeId),
 }
 
 impl System {
@@ -206,6 +212,7 @@ impl System {
             now: 0,
             events: Default::default(),
             nodes: Default::default(),
+            node_id_count: 0,
             num_node_enter: 0,
             num_node_leave: 0,
             storage_loads: Default::default(),
@@ -218,8 +225,9 @@ impl System {
         // every initial node
         let num_node_packet = self.parameters.num_chunk as f64 * self.parameters.target_redundancy
             / self.parameters.num_initial_node as f64;
-        for _ in 0..self.parameters.num_initial_node {
-            self.push_node(rng, num_node_packet)
+        for i in 0..self.parameters.num_initial_node {
+            self.push_node(rng, num_node_packet);
+            self.push_adjust_redundancy_event(i, true, rng)
         }
         self.push_checkpoint();
         self.push_node_enter_event(rng);
@@ -250,6 +258,23 @@ impl System {
                 self.push_checkpoint();
                 self.push_node_leave_event(rng)
             }
+            AdjustRedundancy(node_index, node_id) => {
+                // TODO introduce estimation error
+                let num_node_packet = self.parameters.num_chunk as f64
+                    * self.parameters.target_redundancy
+                    / self.nodes.len() as f64;
+                if let Some(node) = self.nodes.get_mut(node_index) {
+                    if node.id == node_id {
+                        for packets in node.packets.values_mut() {
+                            // TODO increase redundancy
+                            while packets.len() as f64 - num_node_packet >= 1. {
+                                packets.swap_remove(rng.gen_range(0..packets.len()));
+                            }
+                        }
+                        self.push_adjust_redundancy_event(node_index, false, rng)
+                    }
+                }
+            }
         }
     }
 
@@ -264,7 +289,9 @@ impl System {
             }
             packets.insert(data_id as DataId, data_packets);
         }
-        let node = Node { packets };
+        self.node_id_count += 1;
+        let id = self.node_id_count;
+        let node = Node { id, packets };
         self.storage_loads
             .push(node.storage_size() as f32 / self.parameters.num_chunk as f32);
         self.nodes.push(node);
@@ -346,6 +373,19 @@ impl System {
             .sample(rng)
             .ceil() as _;
         self.push_event(after, Event::NodeLeave)
+    }
+
+    fn push_adjust_redundancy_event(&mut self, node_index: usize, delay: bool, rng: &mut impl Rng) {
+        let Some(mut after) = self.parameters.num_census_step else {
+            return;
+        };
+        if delay {
+            after += rng.gen_range(0..after)
+        }
+        self.push_event(
+            after,
+            Event::AdjustRedundancy(node_index, self.nodes[node_index].id),
+        )
     }
 }
 
