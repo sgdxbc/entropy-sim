@@ -36,7 +36,8 @@ fn main() {
         leave_rate: 0.01,
         target_redundancy: r,
         num_chunk: k,
-        num_checkpoint_step: 10_000,
+        num_census_step: None,
+        num_checkpoint_step: 100_000,
         // num_data: 400,
         // num_data: 200,
         num_data: 100,
@@ -121,20 +122,24 @@ struct SystemParameters {
     // protocol
     target_redundancy: f64, // > 1, tolerate (1 - 1 / _) portion of faulty nodes
     num_chunk: usize,       // k
+    num_census_step: Option<u32>,
+    // evaluation
     num_checkpoint_step: u32,
-    // workload
     num_data: usize,
 }
 
 impl SystemParameters {
     fn comma_separated(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{}",
             self.num_initial_node,
             self.enter_rate,
             self.leave_rate,
             self.target_redundancy,
             self.num_chunk,
+            self.num_census_step
+                .map(|n| n.to_string())
+                .unwrap_or("null".into()),
             self.num_checkpoint_step,
             self.num_data,
         )
