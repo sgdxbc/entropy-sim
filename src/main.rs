@@ -65,6 +65,14 @@ fn main() {
         dump_load(&system)
     }
     if args().nth(1).as_deref() == Some("dump-checkpoint") {
+        system.parameters.enter_rate = system.parameters.leave_rate;
+        while system.now < 12_000_000 {
+            system.step(&mut rng);
+            period.run(|| eprint!("{:120}\r", system.report()))
+        }
+        eprint!("{:120}\r", system.report());
+        eprintln!();
+
         dump_checkpoint(&system)
     }
 }
@@ -225,9 +233,8 @@ impl System {
         // every initial node
         let num_node_packet = self.parameters.num_chunk as f64 * self.parameters.target_redundancy
             / self.parameters.num_initial_node as f64;
-        for i in 0..self.parameters.num_initial_node {
-            self.push_node(rng, num_node_packet);
-            self.push_adjust_redundancy_event(i, true, rng)
+        for _ in 0..self.parameters.num_initial_node {
+            self.push_node(rng, num_node_packet)
         }
         self.push_checkpoint();
         self.push_node_enter_event(rng);
@@ -260,14 +267,15 @@ impl System {
             }
             AdjustRedundancy(node_index, node_id) => {
                 // TODO introduce estimation error
-                let num_node_packet = self.parameters.num_chunk as f64
+                let num_node_packet = (self.parameters.num_chunk as f64
                     * self.parameters.target_redundancy
-                    / self.nodes.len() as f64;
+                    / self.nodes.len() as f64)
+                    .ceil() as usize;
                 if let Some(node) = self.nodes.get_mut(node_index) {
                     if node.id == node_id {
                         for packets in node.packets.values_mut() {
                             // TODO increase redundancy
-                            while packets.len() as f64 - num_node_packet >= 1. {
+                            while packets.len() > num_node_packet {
                                 packets.swap_remove(rng.gen_range(0..packets.len()));
                             }
                         }
@@ -294,7 +302,10 @@ impl System {
         let node = Node { id, packets };
         self.storage_loads
             .push(node.storage_size() as f32 / self.parameters.num_chunk as f32);
+        let node_index = self.nodes.len();
         self.nodes.push(node);
+        // not the best way to check for `delay`, but should be good enough
+        self.push_adjust_redundancy_event(node_index, self.now == 0, rng)
     }
 
     fn push_checkpoint(&mut self) {
